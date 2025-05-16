@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11"]
+        python-version: ["3.11", "3.12"]
     name: publish
     steps:
       - name: Check out source repository
@@ -79,18 +79,31 @@ jobs:
         env:
           POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
         run: |
-          cd python/aibrix
+          pushd python/aibrix
           poetry publish --build
+          popd
+
+          pushd python/aibrix_kvcache
+          poetry publish --build
+          popd
       - name: Add package to release artifact
         run: |
-          cd python/aibrix
+          pushd python/aibrix
           poetry build
           ls -al dist/*
+          popd
+
+          pushd python/aibrix_kvcache
+          poetry build
+          ls -al dist/*
+          popd
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aibrix-python-packages
-          path: python/aibrix/dist/*.whl
+          name: aibrix-python-packages-${{ matrix.python-version }}
+          path: |
+            python/aibrix/dist/*.whl
+            python/aibrix_kvcache/dist/*.whl
 
   artifact-release:
     runs-on: ubuntu-latest
@@ -144,11 +157,6 @@ jobs:
         with:
           name: aibrix-core-${{ github.ref_name }}.yaml
 
-      - name: Download PYTHON wheels
-        uses: actions/download-artifact@v4
-        with:
-          name: aibrix-python-packages
-
       # Determine if this is a prerelease based on the tag name
       # if it contains
       - name: Set prerelease flag
@@ -176,5 +184,3 @@ jobs:
           files: |
             aibrix-dependency-${{ github.ref_name }}.yaml
             aibrix-core-${{ github.ref_name }}.yaml
-            aibrix-*.whl
-            aibrix-python-packages/aibrix-*.whl

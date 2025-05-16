@@ -92,6 +92,9 @@ spec:
               value: "16"
             - name: AIBRIX_PREFIX_CACHE_STANDARD_DEVIATION_FACTOR
               value: "2"
+            # Uncomment to enable request tracing for GPU optimizer, default "false".
+            # - name: AIBRIX_GPU_OPTIMIZER_TRACING_FLAG
+            #   value: "true"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -111,17 +114,6 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       serviceAccountName: aibrix-gateway-plugins
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: gateway-plugin-pdb
-  namespace: aibrix-system
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: gateway-plugins
 ---
 # this is a dummy route for incoming request to list models registered to aibrix-control-plane
 # TODO (varun): check if this dummy route can be removed in future

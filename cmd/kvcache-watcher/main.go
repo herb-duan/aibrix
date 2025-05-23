@@ -24,11 +24,15 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/vllm-project/aibrix/pkg/utils"
 
@@ -49,23 +53,57 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const DefaultKVCacheServerPort = 9600
 const KVCacheLabelKeyIdentifier = "kvcache.orchestration.aibrix.ai/name"
 const KVCacheLabelKeyRole = "kvcache.orchestration.aibrix.ai/role"
 const KVCacheLabelValueRoleCache = "cache"
-const KVCacheLabelValueRoleMetadata = "metadata"
-const KVCacheLabelValueRoleKVWatcher = "kvwatcher"
-const RedisNodeMemberKey = "hpkv_nodes"
+const HPKVRedisNodeMemberKey = "hpkv_cluster_metadata"
+const InfiniStoreRedisNodeMemberKey = "kvcache_nodes"
 
 const networkStatusAnnotation = "k8s.volcengine.com/network-status"
 
 var (
-	kvCacheServerRDMAPort = utils.LoadEnvInt("AIBRIX_KVCACHE_RDMA_PORT", 18512)
-	totalSlots            = utils.LoadEnvInt("AIBRIX_KVCACHE_TOTAL_SLOTS", 4096)
-	virtualNodeCount      = utils.LoadEnvInt("AIBRIX_KVCACHE_VIRTUAL_NODE_COUNT", 100)
-
 	config    *rest.Config
 	clientset *kubernetes.Clientset
+)
+
+var (
+	kvCacheBackend                    string
+	kvCacheWatchNS                    string
+	kvCacheWatchClusterId             string
+	kvCacheServerRDMAPort             int
+	kvCacheServerAdminPort            int
+	consistentHashingTotalSlots       int
+	consistentHashingVirtualNodeCount int
+)
+
+var (
+	metadataVersionGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvcache_cluster_version",
+		Help: "Current version of the KVCache cluster metadata.",
+	}, []string{"name"})
+
+	metadataUpgradeCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvcache_metadata_version_upgrade_counter",
+		Help: "Number of times the metadata version has been upgraded.",
+	}, []string{"name"})
+
+	metadataUpdateSkippedCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvcache_metadata_update_skipped",
+		Help: "Number of times there's no valid pods and skip the metadata updates.",
+	}, []string{"name"})
+
+	metadataUpdateFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvcache_metadata_update_failures_total",
+		Help: "Total number of failures when updating cluster metadata to Redis.",
+	}, []string{"name"})
+
+	podStatusPhaseGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "kvcache_pod_status_phase_total",
+			Help: "Number of KVCache pods per status phase.",
+		},
+		[]string{"name", "phase"},
+	)
 )
 
 type SlotRange struct {
@@ -145,16 +183,66 @@ func (v VirtualNode) Index() int {
 	return -1
 }
 
+type KVCacheBackend interface {
+	GetRedisKey() string
+	ExtractIP(ctx context.Context, pod *corev1.Pod) (string, error)
+}
+
+type HPKVBackend struct{}
+
+func (b HPKVBackend) GetRedisKey() string {
+	return HPKVRedisNodeMemberKey
+}
+
+func (b HPKVBackend) ExtractIP(ctx context.Context, pod *corev1.Pod) (string, error) {
+	return GetRDMAIP(ctx, pod)
+}
+
+type InfiniStoreBackend struct{}
+
+func (b InfiniStoreBackend) GetRedisKey() string {
+	return InfiniStoreRedisNodeMemberKey
+}
+
+func (b InfiniStoreBackend) ExtractIP(ctx context.Context, pod *corev1.Pod) (string, error) {
+	return pod.Status.PodIP, nil
+}
+
+func NewKVCacheBackend(backend string) KVCacheBackend {
+	switch backend {
+	case "infinistore":
+		return InfiniStoreBackend{}
+	case "hpkv":
+		fallthrough
+	default:
+		return HPKVBackend{}
+	}
+}
+
 func main() {
 	ctx := context.Background()
+	parseFlags()
+
+	// Register Prometheus metrics
+	prometheus.MustRegister(metadataVersionGauge)
+	prometheus.MustRegister(metadataUpgradeCounter)
+	prometheus.MustRegister(metadataUpdateSkippedCounter)
+	prometheus.MustRegister(metadataUpdateFailures)
+	prometheus.MustRegister(podStatusPhaseGauge)
+
+	// Expose /metrics endpoint
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		klog.Info("Starting Prometheus metrics server on :8000")
+		if err := http.ListenAndServe(":8000", nil); err != nil {
+			klog.Fatalf("Failed to start Prometheus HTTP server: %v", err)
+		}
+	}()
 
 	// read environment variables from env
-	namespace := utils.LoadEnv("WATCH_KVCACHE_NAMESPACE", "default")
-	kvClusterId := os.Getenv("WATCH_KVCACHE_CLUSTER") // e.g., "kvcache.aibrix.ai=llama4"
 	redisAddr := os.Getenv("REDIS_ADDR")
 	redisPass := os.Getenv("REDIS_PASSWORD")
 	redisDatabase := utils.LoadEnvInt("REDIS_DATABASE", 0)
-
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisAddr,
 		Password: redisPass,
@@ -189,10 +277,10 @@ func main() {
 
 	// Create informer factory
 	factory := informers.NewSharedInformerFactoryWithOptions(clientset, 15*time.Second,
-		informers.WithNamespace(namespace),
+		informers.WithNamespace(kvCacheWatchNS),
 		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
-			if kvClusterId != "" {
-				kvClusterLabel := fmt.Sprintf("%s=%s", KVCacheLabelKeyIdentifier, kvClusterId)
+			if kvCacheWatchClusterId != "" {
+				kvClusterLabel := fmt.Sprintf("%s=%s", KVCacheLabelKeyIdentifier, kvCacheWatchClusterId)
 				kvClusterRoleLabel := fmt.Sprintf("%s=%s", KVCacheLabelKeyRole, KVCacheLabelValueRoleCache)
 				opts.LabelSelector = fmt.Sprintf("%s,%s", kvClusterLabel, kvClusterRoleLabel)
 			}
@@ -205,13 +293,13 @@ func main() {
 	podInformer := factory.Core().V1().Pods().Informer()
 	_, err = podInformer.AddEventHandler(&cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			queue.Add(kvClusterId)
+			queue.Add(kvCacheWatchClusterId)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			queue.Add(kvClusterId)
+			queue.Add(kvCacheWatchClusterId)
 		},
 		DeleteFunc: func(obj interface{}) {
-			queue.Add(kvClusterId)
+			queue.Add(kvCacheWatchClusterId)
 		},
 	})
 	if err != nil {
@@ -225,6 +313,8 @@ func main() {
 	factory.Start(stopCh)
 	factory.WaitForCacheSync(stopCh)
 
+	backendImpl := NewKVCacheBackend(kvCacheBackend)
+
 	// Start queue worker in goroutine
 	go func() {
 		for {
@@ -236,7 +326,7 @@ func main() {
 			func(key string) {
 				defer queue.Done(key)
 
-				if err := syncPods(ctx, rdb, podInformer, key); err != nil {
+				if err := syncPods(ctx, rdb, podInformer, key, backendImpl); err != nil {
 					klog.Errorf("syncPods failed for %s: %v, retrying...", key, err)
 					queue.AddRateLimited(key)
 				} else {
@@ -249,17 +339,84 @@ func main() {
 	<-stopCh
 }
 
-func syncPods(ctx context.Context, rdb *redis.Client, informer cache.SharedIndexInformer, kvClusterId string) error {
+func parseFlags() {
+	flag.StringVar(
+		&kvCacheBackend,
+		"kvcache-backend",
+		"hpkv",
+		"KV backend implementation to use. Supported: 'hpkv', 'infinistore'.",
+	)
+
+	flag.StringVar(
+		&kvCacheWatchNS,
+		"kvcache-watch-namespace",
+		utils.LoadEnv("AIBRIX_KVCACHE_WATCH_NAMESPACE", "default"),
+		"Kubernetes namespace to watch for KVCache pods.",
+	)
+
+	flag.StringVar(
+		&kvCacheWatchClusterId,
+		"kvcache-watch-cluster-id",
+		os.Getenv("AIBRIX_KVCACHE_WATCH_CLUSTER"),
+		"Value of the 'kvcache.orchestration.aibrix.ai/name' label to identify the KV cache cluster.",
+	)
+
+	flag.IntVar(
+		&kvCacheServerRDMAPort,
+		"kvcache-server-rdma-port",
+		utils.LoadEnvInt("AIBRIX_KVCACHE_RDMA_PORT", 18512),
+		"RDMA service port used by the KVCache data servers.",
+	)
+
+	flag.IntVar(
+		&kvCacheServerAdminPort,
+		"kvcache-server-admin-port",
+		utils.LoadEnvInt("AIBRIX_KVCACHE_ADMIN_PORT", 9100),
+		"Admin port used for control kv cache server.",
+	)
+
+	flag.IntVar(
+		&consistentHashingTotalSlots,
+		"consistent-hashing-total-slots",
+		4096,
+		"Total number of slots in the consistent hashing ring.",
+	)
+
+	flag.IntVar(
+		&consistentHashingVirtualNodeCount,
+		"consistent-hashing-virtual-node-count",
+		100,
+		"Number of virtual nodes per physical KVCache pod for consistent hashing.",
+	)
+
+	flag.Parse()
+
+	klog.Infof("=== Parsed Flags ===")
+	flag.VisitAll(func(f *flag.Flag) {
+		klog.Infof("%s: %s", f.Name, f.Value)
+	})
+}
+
+func syncPods(
+	ctx context.Context,
+	rdb *redis.Client,
+	informer cache.SharedIndexInformer,
+	kvClusterId string,
+	kvb KVCacheBackend,
+) error {
 	pods := informer.GetStore().List()
 	klog.Infof("%d pods Found in kvcache cluster %s", len(pods), kvClusterId)
 
 	validPods := make([]corev1.Pod, 0)
+	phaseCounts := map[corev1.PodPhase]int{}
 	for _, obj := range pods {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok {
 			klog.Warningf("unexpected object type in informer cache: %T", obj)
 			continue
 		}
+
+		phaseCounts[pod.Status.Phase]++
 
 		// skip pods not belong to current kvcache cluster and kvcache server
 		if _, ok := pod.Labels[KVCacheLabelKeyIdentifier]; !ok {
@@ -275,10 +432,22 @@ func syncPods(ctx context.Context, rdb *redis.Client, informer cache.SharedIndex
 		}
 	}
 
-	nodeSlots := calculateSlotDistribution(validPods, totalSlots, virtualNodeCount)
+	// export pod phase counts
+	podStatusPhaseGauge.Reset()
+	for phase, count := range phaseCounts {
+		podStatusPhaseGauge.WithLabelValues(kvClusterId, string(phase)).Set(float64(count))
+	}
+
+	if len(validPods) == 0 {
+		klog.Warningf("No valid KVCache pods found after filtering for cluster %v", kvClusterId)
+		metadataUpdateSkippedCounter.WithLabelValues(kvClusterId).Inc()
+		return nil
+	}
+
+	nodeSlots := calculateSlotDistribution(validPods, consistentHashingTotalSlots, consistentHashingVirtualNodeCount)
 	currentNodes := make([]NodeInfo, 0)
 	for _, pod := range validPods {
-		rdmaIP, err := GetRDMAIP(ctx, &pod)
+		ip, err := kvb.ExtractIP(ctx, &pod)
 		if err != nil {
 			klog.ErrorS(err, "Failed to get RDMA IP for pod", "pod", pod.Name)
 			continue
@@ -286,29 +455,34 @@ func syncPods(ctx context.Context, rdb *redis.Client, informer cache.SharedIndex
 
 		currentNodes = append(currentNodes, NodeInfo{
 			Name:  pod.Name,
-			Addr:  rdmaIP,
+			Addr:  ip,
 			Port:  kvCacheServerRDMAPort,
-			Slots: mergeSlots(nodeSlots[pod.Name], totalSlots),
+			Slots: mergeSlots(nodeSlots[pod.Name], consistentHashingTotalSlots),
 		})
 	}
 
+	redisKey := kvb.GetRedisKey()
+
 	// get existing nodes
-	val, err := rdb.Get(ctx, RedisNodeMemberKey).Result()
+	val, err := rdb.Get(ctx, redisKey).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("failed to get existing data from redis %v", err)
 	}
 	existingClusterNodes := ClusterNodes{}
 	_ = json.Unmarshal([]byte(val), &existingClusterNodes)
-	klog.Infof("redis get result: key %s, value %s", RedisNodeMemberKey, val)
+	klog.Infof("redis get result: key %s, value %s", redisKey, val)
 
 	needUpdate := !isNodeListEqual(currentNodes, existingClusterNodes.Nodes)
 	if !needUpdate {
 		klog.Infof("Node list unchanged, skipping update, current version: %d", existingClusterNodes.Version)
+		metadataVersionGauge.WithLabelValues(kvClusterId).Set(float64(existingClusterNodes.Version))
+		return nil
 	}
 
 	newVersion := int64(1)
 	if val != "" {
 		newVersion = existingClusterNodes.Version + 1
+		metadataUpgradeCounter.WithLabelValues(kvClusterId).Inc()
 	}
 
 	newData := ClusterNodes{
@@ -323,11 +497,13 @@ func syncPods(ctx context.Context, rdb *redis.Client, informer cache.SharedIndex
 
 	// write to redis using pipeline
 	pipe := rdb.TxPipeline()
-	pipe.Set(ctx, RedisNodeMemberKey, jsonData, 0)
+	pipe.Set(ctx, redisKey, jsonData, 0)
 	if _, err := pipe.Exec(ctx); err != nil {
+		metadataUpdateFailures.WithLabelValues(kvClusterId).Inc()
 		return fmt.Errorf("redis transaction failed: %v", err)
 	}
 
+	metadataVersionGauge.WithLabelValues(kvClusterId).Set(float64(newVersion))
 	klog.InfoS("Successfully updated cluster nodes", "version", newVersion, "nodeCount", len(currentNodes))
 	return nil
 }
